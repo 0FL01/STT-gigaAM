@@ -7,10 +7,13 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
+from textwrap import wrap
 
 import numpy as np
 import onnx_asr
-from rich.console import Console, Group
+from rich.console import Console
+from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
@@ -21,9 +24,20 @@ def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
 
+@dataclass
+class SubtitleEntry:
+    ts: str
+    text: str
+
+
 class TerminalUI:
-    def __init__(self, target: str = ""):
-        self.console = Console(stderr=True)
+    def __init__(
+        self,
+        target: str = "",
+        history_max: int = 500,
+        log_file: str | None = None,
+    ):
+        self.console = Console(stderr=True, soft_wrap=True)
         self.target = target
         self.state = "idle"
         self.rms = 0.0
@@ -31,8 +45,10 @@ class TerminalUI:
         self.in_speech = False
         self.partial = ""
         self.last_final = ""
-        self.history = deque(maxlen=8)
+        self.history = deque(maxlen=history_max)
         self.model = ""
+        self.log_fp = open(log_file, "a", encoding="utf-8") if log_file else None
+
         self.live = Live(
             self.render(),
             console=self.console,
@@ -40,7 +56,13 @@ class TerminalUI:
             redirect_stdout=False,
             redirect_stderr=False,
             transient=False,
+            screen=False,
         )
+
+    def close(self):
+        if self.log_fp:
+            self.log_fp.close()
+            self.log_fp = None
 
     def set_model(self, model_name: str):
         self.model = model_name
@@ -68,22 +90,48 @@ class TerminalUI:
         text = text.strip()
         if not text:
             return
+
+        ts = datetime.now().strftime("%H:%M:%S")
         self.last_final = text
-        self.history.appendleft(text)
+        self.history.append(SubtitleEntry(ts=ts, text=text))
         self.partial = ""
+
+        if self.log_fp:
+            self.log_fp.write(f"[{ts}] {text}\n")
+            self.log_fp.flush()
+
         self.refresh()
 
-    def rms_bar(self, width: int = 30) -> str:
+    def rms_bar(self, width: int = 16) -> str:
         level = min(1.0, self.rms / 0.03)
         filled = int(level * width)
-        empty = width - filled
-        return "█" * filled + "░" * empty
+        return "█" * filled + "░" * (width - filled)
+
+    def _history_text(self, width: int, height: int) -> Text:
+        body_width = max(20, width - 8)
+        lines: list[str] = []
+
+        for item in self.history:
+            prefix = f"[{item.ts}] "
+            usable = max(10, body_width - len(prefix))
+            chunks = wrap(
+                item.text,
+                width=usable,
+                break_long_words=False,
+                break_on_hyphens=False,
+            ) or [item.text]
+
+            lines.append(prefix + chunks[0])
+            for chunk in chunks[1:]:
+                lines.append(" " * len(prefix) + chunk)
+
+        if not lines:
+            return Text("История пока пуста", style="dim")
+
+        visible = lines[-max(3, height - 2) :]
+        return Text("\n".join(visible), style="green")
 
     def render(self):
-        header = Table.grid(expand=True)
-        header.add_column(ratio=1)
-        header.add_column(justify="right")
-
         state_style = {
             "idle": "yellow",
             "listening": "green",
@@ -91,36 +139,44 @@ class TerminalUI:
             "error": "bold red",
         }.get(self.state, "white")
 
-        header.add_row(
-            f"[bold]GigaAM live subtitles[/bold]  [dim]{self.model}[/dim]",
+        # Компактная верхняя строка вместо большого блока
+        top = Table.grid(expand=True)
+        top.add_column(ratio=1)
+        top.add_column(justify="right")
+        top.add_row(
+            f"[bold]GigaAM[/bold] [dim]{self.model}[/dim]  [dim]{self.target or '-'}[/dim]",
             f"[{state_style}]{self.state.upper()}[/{state_style}]",
         )
-        header.add_row(
-            f"[dim]target:[/dim] {self.target or '-'}",
-            f"[dim]rms:[/dim] {self.rms:.5f}",
-        )
-        header.add_row(
-            f"[dim]signal:[/dim] {self.rms_bar()}",
-            f"[dim]voiced:[/dim] {int(self.voiced)}  [dim]speech:[/dim] {int(self.in_speech)}",
+        top.add_row(
+            f"[dim]signal:[/dim] {self.rms_bar()}  [dim]rms:[/dim] {self.rms:.5f}",
+            f"[dim]voiced:[/dim] {int(self.voiced)}  "
+            f"[dim]speech:[/dim] {int(self.in_speech)}",
         )
 
-        partial_text = Text(self.partial or "…", style="bold white")
-        final_text = Text(self.last_final or "—", style="green")
+        current = Table.grid(expand=True)
+        current.add_column()
+        current.add_row(Text(self.partial or "…", style="bold white"))
+        current.add_row(Text(self.last_final or "—", style="green"))
 
-        history_table = Table.grid(expand=True)
-        history_table.add_column()
-        if self.history:
-            for line in self.history:
-                history_table.add_row(f"[green]•[/green] {line}")
-        else:
-            history_table.add_row("[dim]История пока пуста[/dim]")
+        term_w = self.console.size.width
+        term_h = self.console.size.height
 
-        return Group(
-            Panel(header, title="Status", border_style="blue"),
-            Panel(partial_text, title="Current partial", border_style="yellow"),
-            Panel(final_text, title="Last final", border_style="green"),
-            Panel(history_table, title="Recent subtitles", border_style="magenta"),
+        layout = Layout()
+        layout.split_column(
+            Layout(Panel(top, title="Status", border_style="blue"), size=5),
+            Layout(Panel(current, title="Now", border_style="yellow"), size=6),
+            Layout(name="history"),
         )
+
+        history_height = max(8, term_h - 11)
+        layout["history"].update(
+            Panel(
+                self._history_text(term_w, history_height),
+                title=f"Subtitles ({len(self.history)}/{self.history.maxlen})",
+                border_style="magenta",
+            )
+        )
+        return layout
 
     def refresh(self):
         if hasattr(self, "live"):
@@ -333,18 +389,6 @@ def spawn_pw_record(
     )
 
 
-def maybe_emit(text: str, last_text: str | None, prefix: str = "") -> str | None:
-    text = text.strip()
-    if not text:
-        return last_text
-
-    norm = normalize_text(text)
-    if norm and norm != last_text:
-        print(f"{prefix}{text}", flush=True)
-        return norm
-    return last_text
-
-
 def run_capture_loop(args, model, ui) -> None:
     input_block_frames = int(args.input_rate * args.block_sec)
     input_block_bytes = input_block_frames * args.input_channels * 4
@@ -482,7 +526,6 @@ def run_capture_loop(args, model, ui) -> None:
                             eprint(
                                 f"DEBUG partial utt_sec={utterance_sec:.2f} text={text!r}"
                             )
-                        global_last_text = maybe_emit(text, global_last_text)
                         ui.set_partial(text)
                     next_emit_at += args.emit_every_sec
 
@@ -498,9 +541,12 @@ def run_capture_loop(args, model, ui) -> None:
                                 f"DEBUG final utt_sec={utterance_sec:.2f} "
                                 f"silence_sec={silence_sec:.2f} text={text!r}"
                             )
-                        global_last_text = maybe_emit(text, global_last_text)
+                        norm = normalize_text(text)
+                        if norm and norm != global_last_text:
+                            print(text, flush=True)
+                            global_last_text = norm
+
                         ui.add_final(text)
-                        print(text, flush=True)
                         ui.set_state("waiting")
 
                     preroll.clear()
@@ -553,6 +599,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--debug", action="store_true")
     p.add_argument("--rms-log-sec", type=float, default=1.0)
+    p.add_argument("--history-max", type=int, default=500)
+    p.add_argument(
+        "--log-file",
+        default=None,
+        help="path to append finalized subtitles, e.g. /tmp/meeting_subtitles.txt",
+    )
     return p
 
 
@@ -563,11 +615,18 @@ def main() -> int:
     model = onnx_asr.load_model(args.model, quantization=args.quantization)
     eprint("Ready. Waiting for audio stream...")
 
-    ui = TerminalUI(target="")
+    ui = TerminalUI(
+        target="",
+        history_max=args.history_max,
+        log_file=args.log_file,
+    )
     ui.set_model(args.model)
 
-    with ui.live:
-        run_capture_loop(args, model, ui)
+    try:
+        with ui.live:
+            run_capture_loop(args, model, ui)
+    finally:
+        ui.close()
     return 0
 
 
