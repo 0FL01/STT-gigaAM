@@ -9,10 +9,121 @@ from collections import deque
 
 import numpy as np
 import onnx_asr
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
+
+
+class TerminalUI:
+    def __init__(self, target: str = ""):
+        self.console = Console(stderr=True)
+        self.target = target
+        self.state = "idle"
+        self.rms = 0.0
+        self.voiced = False
+        self.in_speech = False
+        self.partial = ""
+        self.last_final = ""
+        self.history = deque(maxlen=8)
+        self.model = ""
+        self.live = Live(
+            self.render(),
+            console=self.console,
+            refresh_per_second=8,
+            redirect_stdout=False,
+            redirect_stderr=False,
+            transient=False,
+        )
+
+    def set_model(self, model_name: str):
+        self.model = model_name
+        self.refresh()
+
+    def set_target(self, target: str):
+        self.target = target
+        self.refresh()
+
+    def set_state(self, state: str):
+        self.state = state
+        self.refresh()
+
+    def set_levels(self, rms: float, voiced: bool, in_speech: bool):
+        self.rms = rms
+        self.voiced = voiced
+        self.in_speech = in_speech
+        self.refresh()
+
+    def set_partial(self, text: str):
+        self.partial = text.strip()
+        self.refresh()
+
+    def add_final(self, text: str):
+        text = text.strip()
+        if not text:
+            return
+        self.last_final = text
+        self.history.appendleft(text)
+        self.partial = ""
+        self.refresh()
+
+    def rms_bar(self, width: int = 30) -> str:
+        level = min(1.0, self.rms / 0.03)
+        filled = int(level * width)
+        empty = width - filled
+        return "█" * filled + "░" * empty
+
+    def render(self):
+        header = Table.grid(expand=True)
+        header.add_column(ratio=1)
+        header.add_column(justify="right")
+
+        state_style = {
+            "idle": "yellow",
+            "listening": "green",
+            "waiting": "cyan",
+            "error": "bold red",
+        }.get(self.state, "white")
+
+        header.add_row(
+            f"[bold]GigaAM live subtitles[/bold]  [dim]{self.model}[/dim]",
+            f"[{state_style}]{self.state.upper()}[/{state_style}]",
+        )
+        header.add_row(
+            f"[dim]target:[/dim] {self.target or '-'}",
+            f"[dim]rms:[/dim] {self.rms:.5f}",
+        )
+        header.add_row(
+            f"[dim]signal:[/dim] {self.rms_bar()}",
+            f"[dim]voiced:[/dim] {int(self.voiced)}  [dim]speech:[/dim] {int(self.in_speech)}",
+        )
+
+        partial_text = Text(self.partial or "…", style="bold white")
+        final_text = Text(self.last_final or "—", style="green")
+
+        history_table = Table.grid(expand=True)
+        history_table.add_column()
+        if self.history:
+            for line in self.history:
+                history_table.add_row(f"[green]•[/green] {line}")
+        else:
+            history_table.add_row("[dim]История пока пуста[/dim]")
+
+        return Group(
+            Panel(header, title="Status", border_style="blue"),
+            Panel(partial_text, title="Current partial", border_style="yellow"),
+            Panel(final_text, title="Last final", border_style="green"),
+            Panel(history_table, title="Recent subtitles", border_style="magenta"),
+        )
+
+    def refresh(self):
+        if hasattr(self, "live"):
+            self.live.update(self.render(), refresh=True)
 
 
 def normalize_text(text: str) -> str:
@@ -51,7 +162,9 @@ def robust_recognize(model, audio: np.ndarray, sample_rate: int) -> str:
         return str(res).strip()
 
 
-def downmix_and_resample(block: np.ndarray, in_channels: int, in_rate: int, out_rate: int) -> np.ndarray:
+def downmix_and_resample(
+    block: np.ndarray, in_channels: int, in_rate: int, out_rate: int
+) -> np.ndarray:
     if in_channels > 1:
         block = block.reshape(-1, in_channels).mean(axis=1)
 
@@ -126,12 +239,17 @@ def spawn_pw_record(
 ) -> subprocess.Popen:
     cmd = [
         "pw-record",
-        "--target", target,
-        "--rate", str(rate),
-        "--channels", str(channels),
-        "--format", "f32",
+        "--target",
+        target,
+        "--rate",
+        str(rate),
+        "--channels",
+        str(channels),
+        "--format",
+        "f32",
         "--raw",
-        "--latency", latency,
+        "--latency",
+        latency,
     ]
 
     if channels == 1:
@@ -164,7 +282,7 @@ def maybe_emit(text: str, last_text: str | None, prefix: str = "") -> str | None
     return last_text
 
 
-def run_capture_loop(args, model) -> None:
+def run_capture_loop(args, model, ui) -> None:
     input_block_frames = int(args.input_rate * args.block_sec)
     input_block_bytes = input_block_frames * args.input_channels * 4
 
@@ -178,6 +296,7 @@ def run_capture_loop(args, model) -> None:
         target = args.target or find_stream_target(args.browser)
 
         if not target:
+            ui.set_state("idle")
             if args.debug:
                 eprint("DEBUG no target yet; waiting...")
             time.sleep(1.0)
@@ -186,6 +305,8 @@ def run_capture_loop(args, model) -> None:
         if target != last_target:
             eprint(f"Attached to PipeWire target: {target}")
             last_target = target
+            ui.set_target(target)
+            ui.set_state("waiting")
 
         proc = spawn_pw_record(
             target=target,
@@ -215,7 +336,9 @@ def run_capture_loop(args, model) -> None:
                     break
                 if len(buf) < input_block_bytes:
                     if args.debug:
-                        eprint(f"DEBUG short read: got={len(buf)} want={input_block_bytes}")
+                        eprint(
+                            f"DEBUG short read: got={len(buf)} want={input_block_bytes}"
+                        )
                     break
 
                 raw = np.frombuffer(buf, dtype=np.float32)
@@ -232,6 +355,8 @@ def run_capture_loop(args, model) -> None:
                 rms = float(np.sqrt(np.mean(mono16 * mono16) + 1e-12))
                 voiced = rms >= args.silence_rms
 
+                ui.set_levels(rms, voiced, in_speech)
+
                 preroll.append(mono16)
 
                 if args.debug and loop_idx % rms_log_every_blocks == 0:
@@ -247,8 +372,11 @@ def run_capture_loop(args, model) -> None:
                     in_speech = True
                     silence_sec = 0.0
                     next_emit_at = max(args.first_emit_sec, args.emit_every_sec)
+                    ui.set_state("listening")
                     if args.debug:
-                        eprint(f"DEBUG speech_start rms={rms:.5f} preroll_sec={utterance_sec:.2f}")
+                        eprint(
+                            f"DEBUG speech_start rms={rms:.5f} preroll_sec={utterance_sec:.2f}"
+                        )
                     continue
 
                 if not in_speech:
@@ -267,11 +395,17 @@ def run_capture_loop(args, model) -> None:
                     if len(audio) / args.asr_rate >= args.min_utt_sec:
                         text = robust_recognize(model, audio, sample_rate=args.asr_rate)
                         if args.debug:
-                            eprint(f"DEBUG partial utt_sec={utterance_sec:.2f} text={text!r}")
+                            eprint(
+                                f"DEBUG partial utt_sec={utterance_sec:.2f} text={text!r}"
+                            )
                         global_last_text = maybe_emit(text, global_last_text)
+                        ui.set_partial(text)
                     next_emit_at += args.emit_every_sec
 
-                if silence_sec >= args.tail_silence_sec or utterance_sec >= args.max_utt_sec:
+                if (
+                    silence_sec >= args.tail_silence_sec
+                    or utterance_sec >= args.max_utt_sec
+                ):
                     audio = np.concatenate(utterance)
                     if len(audio) / args.asr_rate >= args.min_utt_sec:
                         text = robust_recognize(model, audio, sample_rate=args.asr_rate)
@@ -281,6 +415,9 @@ def run_capture_loop(args, model) -> None:
                                 f"silence_sec={silence_sec:.2f} text={text!r}"
                             )
                         global_last_text = maybe_emit(text, global_last_text)
+                        ui.add_final(text)
+                        print(text, flush=True)
+                        ui.set_state("waiting")
 
                     preroll.clear()
                     utterance = []
@@ -302,8 +439,16 @@ def run_capture_loop(args, model) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
     p.add_argument("--browser", default=r"brave|brave-browser")
-    p.add_argument("--target", default=None, help="explicit PipeWire target, e.g. Brave or bluez_output...")
-    p.add_argument("--capture-sink", action="store_true", help="capture sink monitor instead of app stream")
+    p.add_argument(
+        "--target",
+        default=None,
+        help="explicit PipeWire target, e.g. Brave or bluez_output...",
+    )
+    p.add_argument(
+        "--capture-sink",
+        action="store_true",
+        help="capture sink monitor instead of app stream",
+    )
     p.add_argument("--model", default="gigaam-v3-e2e-ctc")
     p.add_argument("--quantization", default=None)
 
@@ -334,7 +479,11 @@ def main() -> int:
     model = onnx_asr.load_model(args.model, quantization=args.quantization)
     eprint("Ready. Waiting for audio stream...")
 
-    run_capture_loop(args, model)
+    ui = TerminalUI(target=args.target or "")
+    ui.set_model(args.model)
+
+    with ui.live:
+        run_capture_loop(args, model, ui)
     return 0
 
 
