@@ -95,7 +95,7 @@ python test_long.py long.wav
 
 ## Realtime субтитры (PipeWire)
 
-Проект включает `brave_pipewire_asr.py` — realtime пайплайн с захватом аудиопотока из PipeWire:
+Проект включает `pipewire_asr.py` — realtime пайплайн с захватом аудиопотока из PipeWire:
 
 - Перехват output stream произвольного приложения (по умолчанию — Brave)
 - Автоматический поиск и переподключение к target
@@ -107,21 +107,21 @@ python test_long.py long.wav
 source .venv/bin/activate
 
 # Субтитры для Brave (автопоиск stream по паттерну)
-python brave_pipewire_asr.py
+python pipewire_asr.py --target Brave
 
 # Явный target (object.serial или node.name)
-python brave_pipewire_asr.py --target 4321
+python pipewire_asr.py --target 4321
 
 # Capture sink monitor (системный звук)
-python brave_pipewire_asr.py --capture-sink
+python pipewire_asr.py --capture-sink
 
 # Другая модель
-python brave_pipewire_asr.py --model gigaam-v3-ctc
+python pipewire_asr.py --model gigaam-v3-ctc
 ```
 
 Параметры VAD и таймингов (при необходимости):
 
-```
+```sh
 --silence-rms 0.0035       RMS-порог тишины
 --tail-silence-sec 0.80    тишине после которой utterance завершается
 --min-utt-sec 0.60         минимальная длина utterance
@@ -140,6 +140,21 @@ python brave_pipewire_asr.py --model gigaam-v3-ctc
 
 ```bash
 ffmpeg -i input.mp3 -ac 1 -ar 16000 -c:a pcm_s16le output.wav
+```
+
+
+## Просмотр активных процессов с аудио:
+```yaml
+pw-dump | jq -r '                                    
+  .[] |                           
+  select(.info.props."media.class" == "Stream/Output/Audio") |
+  [
+    .info.props."object.serial",
+    .info.props."node.name",
+    .info.props."application.name",
+    .info.state,
+    .info.props."media.name"
+  ] | @tsv'
 ```
 
 ## Решение проблем
