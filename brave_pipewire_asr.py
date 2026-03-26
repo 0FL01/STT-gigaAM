@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from collections import deque
+from dataclasses import dataclass
 
 import numpy as np
 import onnx_asr
@@ -185,43 +186,69 @@ def downmix_and_resample(
     return np.interp(x_new, x_old, block).astype(np.float32)
 
 
-def find_stream_target(browser_pattern: str) -> str | None:
+@dataclass
+class PWTarget:
+    object_serial: str
+    node_name: str
+    app_name: str
+    media_name: str
+    state: str
+
+
+def pw_dump_objects():
     out = subprocess.check_output(["pw-dump"], text=True)
-    objects = json.loads(out)
+    return json.loads(out)
 
-    candidates = []
 
-    for obj in objects:
+def iter_output_streams():
+    for obj in pw_dump_objects():
         info = obj.get("info") or {}
         props = info.get("props") or {}
 
         if props.get("media.class") != "Stream/Output/Audio":
             continue
 
-        app_name = str(props.get("application.name", ""))
-        proc_bin = str(props.get("application.process.binary", ""))
-        node_name = str(props.get("node.name", ""))
-        media_name = str(props.get("media.name", ""))
-        node_desc = str(props.get("node.description", ""))
-
-        haystack = " ".join([app_name, proc_bin, node_name, media_name, node_desc])
-
-        if not re.search(browser_pattern, haystack, flags=re.IGNORECASE):
+        object_serial = props.get("object.serial")
+        node_name = props.get("node.name")
+        if not object_serial or not node_name:
             continue
 
-        target = app_name or node_name
-        if not target:
+        yield PWTarget(
+            object_serial=str(object_serial),
+            node_name=str(node_name),
+            app_name=str(props.get("application.name", "")),
+            media_name=str(props.get("media.name", "")),
+            state=str(info.get("state", "")),
+        )
+
+
+STATE_SCORE = {
+    "running": 30,
+    "paused": 20,
+    "idle": 10,
+}
+
+
+def find_stream_target(pattern: str) -> PWTarget | None:
+    rx = re.compile(pattern, re.IGNORECASE)
+    candidates = []
+
+    for s in iter_output_streams():
+        haystack = " ".join([s.node_name, s.app_name, s.media_name])
+
+        if not rx.search(haystack):
             continue
 
-        score = 0
-        if re.search(browser_pattern, proc_bin, flags=re.IGNORECASE):
-            score += 5
-        if re.search(browser_pattern, app_name, flags=re.IGNORECASE):
-            score += 5
-        if str(props.get("media.role", "")).lower() == "communication":
+        score = STATE_SCORE.get(s.state.lower(), 0)
+
+        if rx.search(s.node_name):
+            score += 20
+        if rx.search(s.app_name):
             score += 10
+        if rx.search(s.media_name):
+            score += 5
 
-        candidates.append((score, target, props))
+        candidates.append((score, s))
 
     if not candidates:
         return None
@@ -230,17 +257,54 @@ def find_stream_target(browser_pattern: str) -> str | None:
     return candidates[0][1]
 
 
+def find_exact_target(spec: str) -> PWTarget | None:
+    spec = str(spec)
+    for s in iter_output_streams():
+        if spec == s.object_serial or spec == s.node_name:
+            return s
+    return None
+
+
+def resolve_target(explicit: str | None, browser_pattern: str) -> PWTarget | None:
+    if not explicit:
+        return find_stream_target(browser_pattern)
+
+    # first try exact target match by object.serial or node.name
+    exact = find_exact_target(explicit)
+    if exact:
+        return exact
+
+    # otherwise treat as human-friendly pattern
+    return find_stream_target(re.escape(explicit))
+
+
+def target_exists(object_serial: str) -> bool:
+    for s in iter_output_streams():
+        if s.object_serial == str(object_serial):
+            return True
+    return False
+
+
 def spawn_pw_record(
-    target: str,
+    target_object: str,
     rate: int,
     channels: int,
     latency: str,
     capture_sink: bool,
 ) -> subprocess.Popen:
+    props = {
+        "node.dont-fallback": True,
+        "node.dont-reconnect": True,
+        "node.dont-move": True,
+    }
+
+    if capture_sink:
+        props["stream.capture.sink"] = True
+
     cmd = [
         "pw-record",
         "--target",
-        target,
+        str(target_object),
         "--rate",
         str(rate),
         "--channels",
@@ -250,15 +314,14 @@ def spawn_pw_record(
         "--raw",
         "--latency",
         latency,
+        "-P",
+        json.dumps(props),
     ]
 
     if channels == 1:
         cmd += ["--channel-map", "mono"]
     elif channels == 2:
         cmd += ["--channel-map", "stereo"]
-
-    if capture_sink:
-        cmd += ["-P", '{ "stream.capture.sink": true }']
 
     cmd += ["-"]
 
@@ -293,23 +356,31 @@ def run_capture_loop(args, model, ui) -> None:
     global_last_text = None
 
     while True:
-        target = args.target or find_stream_target(args.browser)
+        resolved = resolve_target(args.target, args.browser)
 
-        if not target:
+        if not resolved:
             ui.set_state("idle")
             if args.debug:
                 eprint("DEBUG no target yet; waiting...")
             time.sleep(1.0)
             continue
 
-        if target != last_target:
-            eprint(f"Attached to PipeWire target: {target}")
-            last_target = target
-            ui.set_target(target)
+        target_serial = resolved.object_serial
+
+        if target_serial != last_target:
+            eprint(
+                f"Attached to PipeWire target: "
+                f"{resolved.app_name or resolved.node_name} "
+                f"(serial={resolved.object_serial}, node={resolved.node_name}, state={resolved.state})"
+            )
+            last_target = target_serial
+            ui.set_target(
+                f"{resolved.app_name or resolved.node_name} [{resolved.object_serial}]"
+            )
             ui.set_state("waiting")
 
         proc = spawn_pw_record(
-            target=target,
+            target_object=target_serial,
             rate=args.input_rate,
             channels=args.input_channels,
             latency=args.latency,
@@ -350,6 +421,7 @@ def run_capture_loop(args, model, ui) -> None:
                 )
 
                 if mono16.size == 0:
+                    loop_idx += 1
                     continue
 
                 rms = float(np.sqrt(np.mean(mono16 * mono16) + 1e-12))
@@ -365,6 +437,18 @@ def run_capture_loop(args, model, ui) -> None:
                         f"in_speech={int(in_speech)} utt_sec={utterance_sec:.2f}"
                     )
                 loop_idx += 1
+
+                # periodically check that pw-record is alive and target still exists
+                if loop_idx % rms_log_every_blocks == 0:
+                    if proc.poll() is not None:
+                        if args.debug:
+                            eprint("DEBUG pw-record exited")
+                        break
+
+                    if not target_exists(target_serial):
+                        if args.debug:
+                            eprint(f"DEBUG target disappeared: serial={target_serial}")
+                        break
 
                 if voiced and not in_speech:
                     utterance = list(preroll)
@@ -442,7 +526,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--target",
         default=None,
-        help="explicit PipeWire target, e.g. Brave or bluez_output...",
+        help="exact PipeWire target: object.serial or node.name (e.g. 1234 or Brave); if not exact, treated as search pattern",
     )
     p.add_argument(
         "--capture-sink",
@@ -479,7 +563,7 @@ def main() -> int:
     model = onnx_asr.load_model(args.model, quantization=args.quantization)
     eprint("Ready. Waiting for audio stream...")
 
-    ui = TerminalUI(target=args.target or "")
+    ui = TerminalUI(target="")
     ui.set_model(args.model)
 
     with ui.live:
