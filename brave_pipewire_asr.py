@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import re
+import select
 import subprocess
 import sys
+import termios
+import threading
 import time
+import tty
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,6 +27,62 @@ from rich.text import Text
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
+
+
+class RawKeyboard:
+    def __init__(self, stream):
+        self.stream = stream
+        self.fd = stream.fileno()
+        self._old = None
+
+    def __enter__(self):
+        self._old = termios.tcgetattr(self.fd)
+        tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._old is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self._old)
+
+
+def read_key(fd: int, timeout: float = 0.1) -> str | None:
+    r, _, _ = select.select([fd], [], [], timeout)
+    if not r:
+        return None
+
+    data = os.read(fd, 1)
+    if not data:
+        return None
+
+    if data == b"\x1b":
+        time.sleep(0.01)
+        while True:
+            r, _, _ = select.select([fd], [], [], 0)
+            if not r:
+                break
+            data += os.read(fd, 1)
+
+    s = data.decode(errors="ignore")
+
+    mapping = {
+        "k": "up",
+        "j": "down",
+        "g": "home",
+        "G": "end",
+        "f": "follow",
+        "q": "quit",
+        " ": "pagedown",
+        "b": "pageup",
+        "\x1b[A": "up",
+        "\x1b[B": "down",
+        "\x1b[5~": "pageup",
+        "\x1b[6~": "pagedown",
+        "\x1b[H": "home",
+        "\x1b[F": "end",
+        "\x1bOH": "home",
+        "\x1bOF": "end",
+    }
+    return mapping.get(s)
 
 
 @dataclass
@@ -48,6 +109,11 @@ class TerminalUI:
         self.history = deque(maxlen=history_max)
         self.model = ""
         self.log_fp = open(log_file, "a", encoding="utf-8") if log_file else None
+
+        self.follow_history = True
+        self.history_scroll = 0
+        self.quit_requested = False
+        self._lock = threading.RLock()
 
         self.live = Live(
             self.render(),
@@ -92,6 +158,11 @@ class TerminalUI:
             return
 
         ts = datetime.now().strftime("%H:%M:%S")
+
+        prev_count = None
+        if not self.follow_history:
+            prev_count = len(self._flatten_history_lines(self.console.size.width))
+
         self.last_final = text
         self.history.append(SubtitleEntry(ts=ts, text=text))
         self.partial = ""
@@ -100,6 +171,10 @@ class TerminalUI:
             self.log_fp.write(f"[{ts}] {text}\n")
             self.log_fp.flush()
 
+        if prev_count is not None:
+            new_count = len(self._flatten_history_lines(self.console.size.width))
+            self.history_scroll += max(0, new_count - prev_count)
+
         self.refresh()
 
     def rms_bar(self, width: int = 16) -> str:
@@ -107,29 +182,91 @@ class TerminalUI:
         filled = int(level * width)
         return "█" * filled + "░" * (width - filled)
 
-    def _history_text(self, width: int, height: int) -> Text:
+    def _iter_history_items(self):
+        for item in self.history:
+            if isinstance(item, str):
+                yield "", item
+            else:
+                yield getattr(item, "ts", ""), getattr(item, "text", str(item))
+
+    def _flatten_history_lines(self, width: int) -> list[str]:
         body_width = max(20, width - 8)
         lines: list[str] = []
 
-        for item in self.history:
-            prefix = f"[{item.ts}] "
+        for ts, text in self._iter_history_items():
+            prefix = f"[{ts}] " if ts else ""
             usable = max(10, body_width - len(prefix))
             chunks = wrap(
-                item.text,
+                text,
                 width=usable,
                 break_long_words=False,
                 break_on_hyphens=False,
-            ) or [item.text]
+            ) or [text]
 
             lines.append(prefix + chunks[0])
             for chunk in chunks[1:]:
                 lines.append(" " * len(prefix) + chunk)
 
-        if not lines:
-            return Text("История пока пуста", style="dim")
+        return lines
 
-        visible = lines[-max(3, height - 2) :]
-        return Text("\n".join(visible), style="green")
+    def _history_viewport(self, width: int, visible_height: int) -> list[str]:
+        all_lines = self._flatten_history_lines(width)
+        if not all_lines:
+            return ["История пока пуста"]
+
+        max_scroll = max(0, len(all_lines) - visible_height)
+        scroll = 0 if self.follow_history else min(self.history_scroll, max_scroll)
+
+        end = len(all_lines) - scroll
+        start = max(0, end - visible_height)
+        return all_lines[start:end]
+
+    def scroll_up(self, lines: int = 1):
+        self.follow_history = False
+        self.history_scroll += max(1, lines)
+        self.refresh()
+
+    def scroll_down(self, lines: int = 1):
+        self.history_scroll = max(0, self.history_scroll - max(1, lines))
+        if self.history_scroll == 0:
+            self.follow_history = True
+        self.refresh()
+
+    def page_up(self):
+        self.scroll_up(max(5, self.console.size.height // 3))
+
+    def page_down(self):
+        self.scroll_down(max(5, self.console.size.height // 3))
+
+    def scroll_home(self):
+        all_lines = self._flatten_history_lines(self.console.size.width)
+        visible_h = max(3, max(8, self.console.size.height - 11) - 2)
+        self.follow_history = False
+        self.history_scroll = max(0, len(all_lines) - visible_h)
+        self.refresh()
+
+    def scroll_end(self):
+        self.history_scroll = 0
+        self.follow_history = True
+        self.refresh()
+
+    def handle_key(self, key: str):
+        if key == "up":
+            self.scroll_up(1)
+        elif key == "down":
+            self.scroll_down(1)
+        elif key == "pageup":
+            self.page_up()
+        elif key == "pagedown":
+            self.page_down()
+        elif key == "home":
+            self.scroll_home()
+        elif key == "end":
+            self.scroll_end()
+        elif key == "follow":
+            self.scroll_end()
+        elif key == "quit":
+            self.quit_requested = True
 
     def render(self):
         state_style = {
@@ -169,10 +306,21 @@ class TerminalUI:
         )
 
         history_height = max(8, term_h - 11)
+        visible_h = max(3, history_height - 2)
+
+        history_lines = self._history_viewport(term_w, visible_h)
+        history_text = Text("\n".join(history_lines), style="green")
+
+        mode = (
+            "FOLLOW"
+            if self.follow_history and self.history_scroll == 0
+            else f"SCROLL +{self.history_scroll}"
+        )
         layout["history"].update(
             Panel(
-                self._history_text(term_w, history_height),
-                title=f"Subtitles ({len(self.history)}/{self.history.maxlen})",
+                history_text,
+                title=f"Subtitles ({len(self.history)}/{self.history.maxlen}) [{mode}]",
+                subtitle="\u2191/k older  \u2193/j newer  PgUp/PgDn  g/G  f follow  q quit",
                 border_style="magenta",
             )
         )
@@ -389,6 +537,14 @@ def spawn_pw_record(
     )
 
 
+def keyboard_loop(ui: TerminalUI, stop_event: threading.Event):
+    fd = sys.stdin.fileno()
+    while not stop_event.is_set() and not ui.quit_requested:
+        key = read_key(fd, timeout=0.1)
+        if key:
+            ui.handle_key(key)
+
+
 def run_capture_loop(args, model, ui) -> None:
     input_block_frames = int(args.input_rate * args.block_sec)
     input_block_bytes = input_block_frames * args.input_channels * 4
@@ -399,7 +555,7 @@ def run_capture_loop(args, model, ui) -> None:
     last_target = None
     global_last_text = None
 
-    while True:
+    while not ui.quit_requested:
         resolved = resolve_target(args.target, args.browser)
 
         if not resolved:
@@ -443,7 +599,7 @@ def run_capture_loop(args, model, ui) -> None:
         loop_idx = 0
 
         try:
-            while True:
+            while not ui.quit_requested:
                 buf = read_exact(proc.stdout, input_block_bytes)
                 if len(buf) == 0:
                     if args.debug:
@@ -622,11 +778,26 @@ def main() -> int:
     )
     ui.set_model(args.model)
 
+    stop_event = threading.Event()
+
     try:
-        with ui.live:
-            run_capture_loop(args, model, ui)
+        if sys.stdin.isatty():
+            with RawKeyboard(sys.stdin):
+                t = threading.Thread(
+                    target=keyboard_loop,
+                    args=(ui, stop_event),
+                    daemon=True,
+                )
+                t.start()
+                with ui.live:
+                    run_capture_loop(args, model, ui)
+        else:
+            with ui.live:
+                run_capture_loop(args, model, ui)
     finally:
+        stop_event.set()
         ui.close()
+
     return 0
 
 
